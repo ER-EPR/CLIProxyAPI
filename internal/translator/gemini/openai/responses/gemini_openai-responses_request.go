@@ -405,6 +405,26 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 		out, _ = sjson.SetRawBytes(out, "generationConfig", genConfig)
 	}
 
+	// Handle JSON schema structured output (OpenAI text.format with type=json_schema)
+	if textFormat := root.Get("text.format"); textFormat.Exists() {
+		formatType := textFormat.Get("type").String()
+		if formatType == "json_schema" {
+			// Set response_mime_type to application/json
+			if !gjson.GetBytes(out, "generationConfig").Exists() {
+				out, _ = sjson.SetRawBytes(out, "generationConfig", []byte(`{}`))
+			}
+			out, _ = sjson.SetBytes(out, "generationConfig.responseMimeType", "application/json")
+
+			// Set responseJsonSchema from the schema field, normalizing it for Gemini's
+			// supported JSON Schema subset (removes unsupported keywords like pattern,
+			// minLength, multipleOf, etc. but preserves additionalProperties, $defs, $ref)
+			if schema := textFormat.Get("schema"); schema.Exists() {
+				schemaStr := normalizeJSONSchema(schema.Raw)
+				out, _ = sjson.SetRawBytes(out, "generationConfig.responseJsonSchema", []byte(schemaStr))
+			}
+		}
+	}
+
 	// Handle temperature if present
 	if temperature := root.Get("temperature"); temperature.Exists() {
 		if !gjson.GetBytes(out, "generationConfig").Exists() {
@@ -458,4 +478,313 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 func openAIResponsesGeminiThoughtSignature(rawSignature string) string {
 	return sigcompat.GeminiReplaySignatureOrBypass(rawSignature, sigcompat.SignatureBlockKindGeminiModelPart)
+}
+
+// normalizeSchemaForGemini recursively normalizes an OpenAI JSON Schema to Gemini's supported subset.
+//
+// OpenAI and Gemini have different JSON Schema support:
+//
+// OpenAI supports:
+// - Types: string, number, boolean, integer, object, array, enum, anyOf
+// - String: pattern, format (date-time, time, date, duration, email, hostname, ipv4, ipv6, uuid)
+// - Number: multipleOf, maximum, exclusiveMaximum, minimum, exclusiveMinimum
+// - Array: minItems, maxItems
+// - Requires: additionalProperties: false, all fields in required
+// - Root must be object (not anyOf)
+// - Does NOT support: allOf, not, dependentRequired, dependentSchemas, if/then/else
+//
+// Gemini supports:
+// - Types: string, number, integer, boolean, object, array, null (via type array ["string", "null"])
+// - Object: properties, required, additionalProperties (boolean or schema)
+// - Array: items, prefixItems, minItems, maxItems
+// - String: enum, format (ONLY date-time, date, time)
+// - Number/Integer: enum, minimum, maximum
+// - Composition: anyOf
+// - Recursive: $ref
+// - Does NOT support: pattern, minLength, maxLength, multipleOf, exclusiveMinimum, exclusiveMaximum,
+//   uniqueItems, contains, const, default, allOf, oneOf, not, if/then/else
+//
+// This function:
+// 1. Preserves additionalProperties (Gemini JSON Schema mode supports it)
+// 2. Merges allOf before iteration to avoid non-deterministic map iteration overwrites
+// 3. Converts oneOf to anyOf, preserves nullable type arrays as-is
+// 4. Removes unsupported keywords: pattern, minLength, maxLength, multipleOf, exclusiveMinimum,
+//    exclusiveMaximum, uniqueItems, contains, const, default
+// 5. Filters format to only date-time, date, time
+// 6. Recursively processes all nested schemas
+func normalizeSchemaForGemini(schema interface{}) interface{} {
+	switch v := schema.(type) {
+	case map[string]interface{}:
+		// If allOf exists, merge it first to avoid non-deterministic overwrites during map iteration
+		if allOf, exists := v["allOf"]; exists {
+			if allOfArray, ok := allOf.([]interface{}); ok {
+				merged := mergeAllOf(allOfArray)
+				for k, val := range v {
+					if k == "allOf" {
+						continue
+					}
+					if k == "properties" {
+						mergedProps, _ := merged["properties"].(map[string]interface{})
+						if mergedProps == nil {
+							mergedProps = make(map[string]interface{})
+						} else {
+							// Copy to avoid mutating original
+							newProps := make(map[string]interface{})
+							for pk, pv := range mergedProps {
+								newProps[pk] = pv
+							}
+							mergedProps = newProps
+						}
+						if vProps, ok := val.(map[string]interface{}); ok {
+							for pk, pv := range vProps {
+								mergedProps[pk] = pv
+							}
+						}
+						merged["properties"] = mergedProps
+					} else if k == "required" {
+						var mergedReq []interface{}
+						if mr, ok := merged["required"].([]interface{}); ok {
+							mergedReq = append(mergedReq, mr...)
+						}
+						if vr, ok := val.([]interface{}); ok {
+							mergedReq = append(mergedReq, vr...)
+						}
+						merged["required"] = mergedReq
+					} else {
+						merged[k] = val
+					}
+				}
+				v = merged
+			}
+		}
+
+		result := make(map[string]interface{})
+
+		for key, val := range v {
+			switch key {
+			case "allOf":
+				// Already merged pre-iteration
+				continue
+
+			case "additionalProperties":
+				// Preserve additionalProperties - Gemini JSON Schema mode supports it
+				// Normalize if it's a schema, pass through booleans as-is
+				if boolVal, ok := val.(bool); ok {
+					result[key] = boolVal
+				} else {
+					result[key] = normalizeSchemaForGemini(val)
+				}
+
+			case "type":
+				// Preserve type arrays with null (e.g., ["string", "null"]) for downstream handling
+				// - Gemini/Vertex support type arrays natively
+				// - CLI/Antigravity paths use CleanJSONSchemaForGemini which converts to description hints
+				// Only flatten non-null type arrays (e.g., ["string", "integer"]) to anyOf
+				if typeArray, ok := val.([]interface{}); ok {
+					var nonNullTypes []string
+					hasNull := false
+					for _, t := range typeArray {
+						if typeStr, ok := t.(string); ok {
+							if typeStr == "null" {
+								hasNull = true
+							} else {
+								nonNullTypes = append(nonNullTypes, typeStr)
+							}
+						}
+					}
+					// If contains null, preserve the array as-is
+					if hasNull {
+						result[key] = val
+					} else if len(nonNullTypes) == 1 {
+						// Single non-null type - use scalar
+						result["type"] = nonNullTypes[0]
+					} else if len(nonNullTypes) > 1 {
+						// Multiple non-null types - use anyOf
+						var anyOfSchemas []map[string]interface{}
+						for _, t := range nonNullTypes {
+							schema := map[string]interface{}{"type": t}
+							anyOfSchemas = append(anyOfSchemas, schema)
+						}
+						result["anyOf"] = anyOfSchemas
+					}
+				} else {
+					// Keep single type as-is
+					result[key] = val
+				}
+
+			case "properties":
+				// Recursively normalize each property
+				if propsMap, ok := val.(map[string]interface{}); ok {
+					normalizedProps := make(map[string]interface{})
+					for propName, propSchema := range propsMap {
+						normalizedProps[propName] = normalizeSchemaForGemini(propSchema)
+					}
+					result[key] = normalizedProps
+				}
+
+			case "items":
+				// Recursively normalize items schema
+				result[key] = normalizeSchemaForGemini(val)
+
+			case "anyOf":
+				// Recursively normalize each anyOf option
+				if anyOfArray, ok := val.([]interface{}); ok {
+					normalized := make([]interface{}, len(anyOfArray))
+					for i, subSchema := range anyOfArray {
+						normalized[i] = normalizeSchemaForGemini(subSchema)
+					}
+					result[key] = normalized
+				}
+
+			case "oneOf":
+				// Convert oneOf to anyOf
+				if oneOfArray, ok := val.([]interface{}); ok {
+					normalized := make([]interface{}, len(oneOfArray))
+					for i, subSchema := range oneOfArray {
+						normalized[i] = normalizeSchemaForGemini(subSchema)
+					}
+					result["anyOf"] = normalized
+				}
+
+			case "prefixItems":
+				// Recursively normalize prefix items
+				if itemsArray, ok := val.([]interface{}); ok {
+					normalized := make([]interface{}, len(itemsArray))
+					for i, item := range itemsArray {
+						normalized[i] = normalizeSchemaForGemini(item)
+					}
+					result[key] = normalized
+				}
+
+			case "format":
+				// Only preserve supported formats: date-time, date, time
+				if formatStr, ok := val.(string); ok {
+					if formatStr == "date-time" || formatStr == "date" || formatStr == "time" {
+						result[key] = val
+					}
+					// Drop other formats (email, hostname, ipv4, ipv6, uuid, duration)
+				}
+
+			case "required", "enum", "title", "description", "minimum", "maximum",
+				"minItems", "maxItems":
+				// These are supported by Gemini, preserve as-is
+				result[key] = val
+
+			case "$ref":
+				// Gemini supports $ref for recursive schemas
+				result[key] = val
+
+			case "$defs", "definitions":
+				// Preserve definition for recursive schemas
+				if defsMap, ok := val.(map[string]interface{}); ok {
+					normalized := make(map[string]interface{})
+					for k, def := range defsMap {
+						normalized[k] = normalizeSchemaForGemini(def)
+					}
+					result[key] = normalized
+				}
+
+			// Skip unsupported keywords:
+			// pattern, minLength, maxLength (string constraints)
+			// multipleOf, exclusiveMinimum, exclusiveMaximum (number constraints)
+			// uniqueItems, contains (array constraints)
+			// const, default (value constraints)
+			// not, if, then, else (composition)
+			// dependentRequired, dependentSchemas (dependencies)
+			}
+		}
+
+		return result
+
+	case []interface{}:
+		result := make([]interface{}, len(v))
+		for i, item := range v {
+			result[i] = normalizeSchemaForGemini(item)
+		}
+		return result
+
+	default:
+		return v
+	}
+}
+
+// mergeAllOf merges all schemas in an allOf array into a single schema
+func mergeAllOf(schemas []interface{}) map[string]interface{} {
+	merged := make(map[string]interface{})
+	properties := make(map[string]interface{})
+	var required []interface{}
+
+	for _, schema := range schemas {
+		if schemaMap, ok := schema.(map[string]interface{}); ok {
+			for k, v := range schemaMap {
+				switch k {
+				case "properties":
+					if propsMap, ok := v.(map[string]interface{}); ok {
+						for pk, pv := range propsMap {
+							properties[pk] = pv
+						}
+					}
+				case "required":
+					if reqArray, ok := v.([]interface{}); ok {
+						required = append(required, reqArray...)
+					}
+				default:
+					merged[k] = v
+				}
+			}
+		}
+	}
+
+	// Build final merged schema
+	if len(properties) > 0 {
+		merged["properties"] = properties
+	}
+	if len(required) > 0 {
+		// Deduplicate required fields
+		seen := make(map[string]bool)
+		var uniqueRequired []interface{}
+		for _, r := range required {
+			if rStr, ok := r.(string); ok {
+				if !seen[rStr] {
+					seen[rStr] = true
+					uniqueRequired = append(uniqueRequired, rStr)
+				}
+			}
+		}
+		if len(uniqueRequired) > 0 {
+			merged["required"] = uniqueRequired
+		}
+	}
+
+	return merged
+}
+
+// normalizeJSONSchema parses a JSON schema string, normalizes it for Gemini's supported subset,
+// and returns the normalized JSON string. This is the main entry point for schema normalization.
+//
+// The function handles the complete conversion from OpenAI's JSON Schema format to Gemini's
+// supported subset, including:
+// - Removing unsupported keywords (pattern, minLength, multipleOf, etc.)
+// - Preserving nullable type arrays ["string", "null"]
+// - Preserving additionalProperties constraints
+// - Filtering format values to only date-time, date, time
+// - Recursively processing all nested schemas
+//
+// If parsing fails, the original schema is returned unchanged.
+func normalizeJSONSchema(schemaJSON string) string {
+	var schema interface{}
+	decoder := json.NewDecoder(strings.NewReader(schemaJSON))
+	decoder.UseNumber()
+	if err := decoder.Decode(&schema); err != nil {
+		return schemaJSON
+	}
+
+	normalized := normalizeSchemaForGemini(schema)
+
+	result, err := json.Marshal(normalized)
+	if err != nil {
+		return schemaJSON
+	}
+
+	return string(result)
 }
